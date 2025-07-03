@@ -360,7 +360,14 @@ HTML_TEMPLATE = """
         const body = {
           engine: engine.value, server: conn.value,
           database: db.value, table: table.value,
-          conditionsInsert: state.insert.conds.filter(c => c), // Enviar solo los no nulos
+
+          // Enviar el estado de los checkboxes
+          use_conditions_insert: toggles.insert.checked,
+          use_conditions_update: toggles.update.checked,
+          use_conditions_select: toggles.select.checked,
+          use_conditions_delete: toggles.delete.checked,
+
+          conditionsInsert: state.insert.conds.filter(c => c),
           selectFieldsInsert: state.insert.cols.filter(c => c),
           conditionsUpdate: state.update.conds.filter(c => c),
           selectFieldsUpdate: state.update.cols.filter(c => c),
@@ -534,9 +541,157 @@ def api_generate():
 
 def make_sp(op, data, schema):
     """
-    Genera un único procedimiento almacenado.
-    Incluye la lógica de IF EXISTS solo si se proporcionan condiciones explícitas.
+    Genera un único procedimiento almacenado con formato personalizable.
     """
+    db_name = sanitize_ident(data['database'])
+    table_name_raw = data['table'] # Nombre de tabla sin sanitizar para el nombre del SP
+    table_name_sanitized = sanitize_ident(table_name_raw)
+
+    op_map = {
+        'insert': 'insertar',
+        'update': 'actualizar',
+        'delete': 'eliminar',
+        'select': 'mostrar'
+    }
+    proc_op_prefix = op_map.get(op, op) # Fallback al 'op' original si no está en el map
+    proc_name = f"{proc_op_prefix}_{table_name_raw.replace(' ', '_')}"
+
+    # 1. Definir parámetros del SP
+    if op == 'insert':
+        param_cols_for_sp_signature = [c for c in schema if not c['is_identity']]
+    else:
+        param_cols_for_sp_signature = schema
+
+    param_defs_list = []
+    for c in param_cols_for_sp_signature:
+        param_name = sanitize_ident(c['name']).strip('[]')
+        sql_type = c['type'].upper()
+        if c['type'].lower() == 'image':
+            sql_type = 'IMAGE' # MySQL no tiene IMAGE, pero SQL Server sí.
+        elif c.get('length') and sql_type in ('VARCHAR','NVARCHAR','CHAR','NCHAR', 'VARBINARY'):
+            length_val = 'MAX' if c['length'] == -1 or str(c['length']).lower() == 'max' else str(c['length'])
+            sql_type += f"({length_val})"
+        param_defs_list.append(f"@{param_name} As {sql_type.lower()}") # Tipo en minúscula como en el ejemplo
+
+    params_sql = ""
+    if param_defs_list:
+        params_sql = "\n" + ",\n".join([f"    {p}" for p in param_defs_list])
+
+    # 2. Lógica de Condiciones (IF EXISTS / WHERE)
+    user_wants_conditions = data.get(f'use_conditions_{op}', False)
+    conditions_from_user = data.get(f'conditions{op.capitalize()}', [])
+    valid_user_conditions = [c for c in conditions_from_user if c and c.get('tableField') and c.get('procParam')]
+
+    exists_block_str = "" # Contendrá todo el bloque IF EXISTS ... ELSE ...
+    where_clause_str = ""
+    condition_expression_str = ""
+
+    if user_wants_conditions and valid_user_conditions:
+        condition_parts = []
+        for i, cond_data in enumerate(valid_user_conditions):
+            logical_op = f"{cond_data['logic']} " if i > 0 and cond_data.get('logic') else ""
+            # Usar nombres de campo y parámetro sanitizados y sin corchetes para la expresión
+            table_field_for_cond = sanitize_ident(cond_data['tableField']) # Mantener corchetes para nombres de campo SQL
+            operator_val = cond_data['operator']
+            param_field_for_cond = sanitize_ident(cond_data['procParam'].lstrip('@')).strip('[]')
+            condition_parts.append(f"{logical_op}{table_field_for_cond} {operator_val} @{param_field_for_cond}")
+
+        if condition_parts:
+            condition_expression_str = " ".join(condition_parts)
+            # Para el ejemplo: IF EXISTS(SELECT Login FROM USUARIOS WHERE (Login = @Login AND idUsuario <> @idUsuario))
+            # La subconsulta SELECT dentro de IF EXISTS necesita ser construida cuidadosamente.
+            # Usamos el primer campo de la condición para el SELECT, o '1' si no hay campos de selección especificados.
+            select_fields_for_exists_raw = data.get(f'selectFields{op.capitalize()}', [])
+            select_fields_for_exists_list = [sanitize_ident(f) for f in select_fields_for_exists_raw if f and f.strip()]
+            if not select_fields_for_exists_list and valid_user_conditions: # Usar el primer campo de la condición si no se especifica nada
+                 select_fields_for_exists_list = [sanitize_ident(valid_user_conditions[0]['tableField'])]
+            elif not select_fields_for_exists_list:
+                 select_fields_for_exists_list = ['1'] # Fallback a '1'
+
+            select_sql_for_exists = ', '.join(select_fields_for_exists_list)
+
+            if op in ('insert', 'update') and condition_expression_str:
+                # Formato IF EXISTS solicitado:
+                # IF EXISTS(SELECT Login FROM USUARIOS WHERE (Login = @Login AND idUsuario <> @idUsuario))
+                #     RAISERROR('Ya existe registro',16,1);
+                # Else
+                #     <main_operation>
+                # Nota: El RETURN después de RAISERROR es importante y se mantiene.
+                exists_block_str = (
+                    f"IF EXISTS(SELECT {select_sql_for_exists} FROM {table_name_sanitized} WHERE ({condition_expression_str}))\n"
+                    f"    RAISERROR('Ya existe registro',16,1);\n" # Mensaje genérico como en el ejemplo
+                    f"    RETURN;\n" # Mantener RETURN para detener ejecución
+                    f"Else\n"
+                )
+
+            if op in ('update', 'select', 'delete') and condition_expression_str:
+                where_clause_str = f"WHERE {condition_expression_str}"
+
+    # 3. Construir el cuerpo principal de la SQL
+    main_sql_body = ""
+    if op == 'insert':
+        insertable_cols_schema = [c for c in schema if not c['is_identity']]
+        # Para INSERT sin lista de columnas, los VALUES deben coincidir con el orden de la tabla
+        # y solo incluir columnas no-identidad.
+        insert_val_params = [f"@{sanitize_ident(c['name']).strip('[]')}" for c in insertable_cols_schema]
+        formatted_values = "\n" + ",\n".join([f"    {p}" for p in insert_val_params]) + "\n"
+        main_sql_body = f"INSERT INTO {table_name_sanitized}\nValues ({formatted_values});"
+
+    elif op == 'update':
+        updateable_cols_schema = [c for c in schema if not c['is_pk']]
+        if not updateable_cols_schema:
+             main_sql_body = "RAISERROR('Tabla sin columnas actualizables.', 16, 1);\nRETURN;"
+        else:
+            set_clauses = [f"{sanitize_ident(c['name'])} = @{sanitize_ident(c['name']).strip('[]')}" for c in updateable_cols_schema]
+            # Formato de múltiples líneas para SET si son muchas columnas
+            if len(set_clauses) > 2:
+                set_sql = "\n" + ",\n".join([f"    {s}" for s in set_clauses]) + "\n"
+            else:
+                set_sql = ", ".join(set_clauses)
+            main_sql_body = f"UPDATE {table_name_sanitized}\nSET {set_sql}{where_clause_str};"
+
+    elif op == 'select':
+        select_fields_display_raw = data.get(f'selectFields{op.capitalize()}', ['*'])
+        select_fields_display_list = [sanitize_ident(f) for f in select_fields_display_raw if f and f.strip()]
+        if not select_fields_display_list:
+            select_fields_display_list = ['*']
+        main_sql_body = f"SELECT {', '.join(select_fields_display_list)}\nFROM {table_name_sanitized}\n{where_clause_str};"
+
+    elif op == 'delete':
+        main_sql_body = f"DELETE FROM {table_name_sanitized}\n{where_clause_str};"
+
+    # 4. Ensamblar todo el procedimiento
+    sp_parts = [f"USE {db_name};", "GO", f"CREATE PROC {proc_name}"]
+    if params_sql:
+        sp_parts.append(params_sql)
+    sp_parts.append("As")
+
+    # Lógica para indentar el cuerpo principal si está dentro de un ELSE
+    # o si no hay IF EXISTS.
+    final_main_body = ""
+    if exists_block_str: # Si hay un bloque IF EXISTS...ELSE
+        sp_parts.append(exists_block_str.rstrip()) # Añadir el IF...ELSE (sin el último newline del else)
+        # El main_sql_body va después del "Else\n" y debe estar indentado si el estilo lo requiere
+        # o si es multi-línea. El ejemplo no indenta mucho.
+        # Se asume que main_sql_body ya tiene su propio formato de indentación interna.
+        final_main_body = main_sql_body
+    else: # No hay IF EXISTS
+        final_main_body = main_sql_body
+
+    # Añadir el cuerpo principal (indentado o no según el caso)
+    # El textwrap.indent podría ser útil aquí si se necesita una indentación consistente.
+    # Por ahora, se asume que el formato de main_sql_body y exists_block_str es el deseado.
+    # Si main_sql_body es multi-línea, cada línea después de la primera del "Else" podría necesitar indentación.
+    # El ejemplo del usuario para IF/ELSE/INSERT no indenta el INSERT.
+    sp_parts.append(final_main_body)
+
+    sp_parts.append("GO")
+
+    # Unir todas las partes. textwrap.dedent no se usa aquí porque el formato es muy específico.
+    full_sp_text = "\n".join(sp_parts)
+
+    # Limpieza final de múltiples líneas en blanco, dejando solo una.
+    return re.sub(r'\n\s*\n', '\n\n', full_sp_text).strip()
     table = sanitize_ident(data['table'])
     
     # 1. Definir parámetros del SP
